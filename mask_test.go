@@ -72,7 +72,7 @@ func TestMaskBytes_Idempotent(t *testing.T) {
 	}
 }
 
-func TestMaskBytes_SafeMatchesOptimized(t *testing.T) {
+func TestMaskBytes_VariousSizes(t *testing.T) {
 	key := [4]byte{0x12, 0x34, 0x56, 0x78}
 	for _, size := range []int{0, 1, 3, 4, 7, 8, 15, 16, 31, 32, 100, 1024} {
 		original := make([]byte, size)
@@ -80,16 +80,16 @@ func TestMaskBytes_SafeMatchesOptimized(t *testing.T) {
 			original[i] = byte(i * 3)
 		}
 
-		safe := make([]byte, size)
-		copy(safe, original)
-		maskBytesSafe(key, 0, safe)
+		b := make([]byte, size)
+		copy(b, original)
+		maskBytes(key, 0, b)
 
-		optimized := make([]byte, size)
-		copy(optimized, original)
-		maskBytes(key, 0, optimized)
-
-		if !bytes.Equal(safe, optimized) {
-			t.Fatalf("size=%d: safe and optimized differ", size)
+		// Verify each byte.
+		for i, v := range original {
+			want := v ^ key[i%4]
+			if b[i] != want {
+				t.Fatalf("size=%d, byte %d: got %x, want %x", size, i, b[i], want)
+			}
 		}
 	}
 }
