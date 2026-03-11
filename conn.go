@@ -42,6 +42,10 @@ type Conn struct {
 	pongHandler  func(appData string) error
 	closeHandler func(code int, text string) error
 
+	// Compression state
+	writeCompress    bool
+	compressionLevel int
+
 	// Close state
 	closeSent bool
 }
@@ -76,15 +80,14 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 }
 
 // WriteMessage writes a complete message to the connection.
+// Unlike NextWriter+Write+Close, this sends a single final frame.
 func (c *Conn) WriteMessage(messageType int, data []byte) error {
-	w, err := c.NextWriter(messageType)
-	if err != nil {
-		return err
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closeSent {
+		return ErrCloseSent
 	}
-	if _, err := w.Write(data); err != nil {
-		return err
-	}
-	return w.Close()
+	return c.writeFrame(true, messageType, data)
 }
 
 // NextReader returns the next data message from the peer.
