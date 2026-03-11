@@ -2,6 +2,7 @@ package loom
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -235,13 +236,43 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 func (c *Conn) Close() error {
 	c.writeMu.Lock()
 	if !c.closeSent {
+		// Write close frame directly to the underlying conn (bypassing
+		// bufio) so the write deadline is respected without interference
+		// from buffered data.
 		c.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 		msg := FormatCloseMessage(CloseNormalClosure, "")
-		c.writeFrame(true, opClose, msg) // ignore error — best effort
+		c.writeCloseDirect(msg) // ignore error — best effort
 		c.closeSent = true
 	}
 	c.writeMu.Unlock()
 	return c.conn.Close()
+}
+
+// writeCloseDirect writes a close frame directly to the underlying conn,
+// bypassing bufio. This ensures the write deadline set by Close() is
+// respected even if the bufio.Writer has pending data.
+func (c *Conn) writeCloseDirect(payload []byte) {
+	h := frameHeader{
+		fin:    true,
+		opcode: opClose,
+		length: int64(len(payload)),
+	}
+	if !c.isServer {
+		h.masked = true
+		rand.Read(h.mask[:])
+	}
+
+	var buf bytes.Buffer
+	writeFrameHeader(&buf, h)
+	if h.masked && len(payload) > 0 {
+		masked := make([]byte, len(payload))
+		copy(masked, payload)
+		maskBytes(h.mask, 0, masked)
+		buf.Write(masked)
+	} else {
+		buf.Write(payload)
+	}
+	c.conn.Write(buf.Bytes()) // best-effort, ignore error
 }
 
 // LocalAddr returns the local network address.
