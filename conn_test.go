@@ -2,6 +2,8 @@ package loom
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -350,11 +352,38 @@ func writeRawFrame(w io.Writer, fin bool, opcode int, payload []byte) error {
 	return nil
 }
 
-// --- Bug #97: ReadLimit must be enforced per-message, not per-frame ---
+// writeRawFrameRSV writes a raw frame with RSV bits set.
+func writeRawFrameRSV(w io.Writer, fin bool, rsv1, rsv2, rsv3 bool, opcode int, payload []byte) error {
+	h := frameHeader{
+		fin:    fin,
+		rsv1:   rsv1,
+		rsv2:   rsv2,
+		rsv3:   rsv3,
+		opcode: opcode,
+		length: int64(len(payload)),
+	}
+	if err := writeFrameHeader(w, h); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		_, err := w.Write(payload)
+		return err
+	}
+	return nil
+}
+
+// writeRawCloseFrame writes a close frame with the given code.
+func writeRawCloseFrame(w io.Writer, code int) error {
+	payload := make([]byte, 2)
+	binary.BigEndian.PutUint16(payload, uint16(code))
+	return writeRawFrame(w, true, opClose, payload)
+}
+
+// --- Bug #97 Tests: ReadLimit per-message enforcement ---
 
 func TestReadLimit_FragmentedMessage(t *testing.T) {
 	// A message fragmented into frames each smaller than readLimit,
-	// but whose total exceeds readLimit, must return ErrReadLimit.
+	// but whose total exceeds readLimit, should return ErrReadLimit.
 	s, c := net.Pipe()
 	defer s.Close()
 	defer c.Close()
@@ -426,5 +455,229 @@ func TestReadLimit_SingleFrameExceedsLimit(t *testing.T) {
 	_, _, err := server.ReadMessage()
 	if err != ErrReadLimit {
 		t.Fatalf("got %v, want ErrReadLimit", err)
+	}
+}
+
+// --- Bug #98 Tests: RSV bit validation and close code validation ---
+
+func TestRSV1_RejectedWithoutCompression(t *testing.T) {
+	// RSV1=1 without compression negotiated should be rejected.
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	// compressionNegotiated defaults to false
+
+	go func() {
+		writeRawFrameRSV(c, true, true, false, false, opText, []byte("hello"))
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error for RSV1 set without compression")
+	}
+	var ce *CloseError
+	if !errors.As(err, &ce) || ce.Code != CloseProtocolError {
+		t.Fatalf("got %v, want CloseProtocolError", err)
+	}
+}
+
+func TestRSV1_AllowedWithCompression(t *testing.T) {
+	// RSV1=1 should be accepted when compression is negotiated.
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	server.compressionNegotiated = true
+
+	go func() {
+		writeRawFrameRSV(c, true, true, false, false, opText, []byte("hello"))
+	}()
+
+	msgType, p, err := server.ReadMessage()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if msgType != TextMessage {
+		t.Fatalf("type: got %d, want %d", msgType, TextMessage)
+	}
+	if string(p) != "hello" {
+		t.Fatalf("payload: got %q, want %q", string(p), "hello")
+	}
+}
+
+func TestRSV2_Rejected(t *testing.T) {
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+
+	go func() {
+		writeRawFrameRSV(c, true, false, true, false, opText, []byte("hello"))
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error for RSV2 set")
+	}
+	var ce *CloseError
+	if !errors.As(err, &ce) || ce.Code != CloseProtocolError {
+		t.Fatalf("got %v, want CloseProtocolError", err)
+	}
+}
+
+func TestRSV3_Rejected(t *testing.T) {
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+
+	go func() {
+		writeRawFrameRSV(c, true, false, false, true, opText, []byte("hello"))
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error for RSV3 set")
+	}
+	var ce *CloseError
+	if !errors.As(err, &ce) || ce.Code != CloseProtocolError {
+		t.Fatalf("got %v, want CloseProtocolError", err)
+	}
+}
+
+func TestCloseCode_InvalidCodes(t *testing.T) {
+	invalidCodes := []int{
+		0,    // < 1000
+		999,  // < 1000
+		1004, // reserved
+		1005, // must not appear in close frame
+		1006, // must not appear in close frame
+		1015, // must not appear in close frame
+		1016, // unassigned
+		2999, // unassigned
+		5000, // out of range
+		9999, // out of range
+	}
+
+	for _, code := range invalidCodes {
+		t.Run(
+			"code_"+string(rune('0'+code/1000))+string(rune('0'+(code/100)%10))+string(rune('0'+(code/10)%10))+string(rune('0'+code%10)),
+			func(t *testing.T) {
+				s, c := net.Pipe()
+				defer s.Close()
+				defer c.Close()
+
+				server := newConn(s, true)
+				// Suppress default close handler writing back.
+				server.SetCloseHandler(func(code int, text string) error {
+					return &CloseError{Code: code, Text: text}
+				})
+
+				go func() {
+					writeRawCloseFrame(c, code)
+				}()
+
+				_, _, err := server.ReadMessage()
+				if err == nil {
+					t.Fatalf("expected error for invalid close code %d", code)
+				}
+				var ce *CloseError
+				if !errors.As(err, &ce) || ce.Code != CloseProtocolError {
+					t.Fatalf("code %d: got %v, want CloseProtocolError", code, err)
+				}
+			},
+		)
+	}
+}
+
+func TestCloseCode_ValidCodes(t *testing.T) {
+	validCodes := []int{
+		1000, // normal closure
+		1001, // going away
+		1002, // protocol error
+		1003, // unsupported data
+		1007, // invalid frame payload data
+		1008, // policy violation
+		1009, // message too big
+		1010, // mandatory extension
+		1011, // internal server error
+		1012, // service restart
+		1013, // try again later
+		3000, // registered: libraries
+		3999, // registered: libraries
+		4000, // private use
+		4999, // private use
+	}
+
+	for _, code := range validCodes {
+		t.Run(
+			"code_"+string(rune('0'+code/1000))+string(rune('0'+(code/100)%10))+string(rune('0'+(code/10)%10))+string(rune('0'+code%10)),
+			func(t *testing.T) {
+				s, c := net.Pipe()
+				defer s.Close()
+				defer c.Close()
+
+				server := newConn(s, true)
+				receivedCode := make(chan int, 1)
+				server.SetCloseHandler(func(code int, text string) error {
+					receivedCode <- code
+					return &CloseError{Code: code, Text: text}
+				})
+
+				go func() {
+					writeRawCloseFrame(c, code)
+				}()
+
+				_, _, err := server.ReadMessage()
+				// We expect a CloseError but with the code we sent (not protocol error).
+				var ce *CloseError
+				if !errors.As(err, &ce) {
+					t.Fatalf("code %d: expected CloseError, got %v", code, err)
+				}
+				if ce.Code != code {
+					t.Fatalf("code %d: got code %d", code, ce.Code)
+				}
+
+				select {
+				case got := <-receivedCode:
+					if got != code {
+						t.Fatalf("handler got code %d, want %d", got, code)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for close handler")
+				}
+			},
+		)
+	}
+}
+
+func TestCloseCode_SingleBytePayload(t *testing.T) {
+	// A close frame with exactly 1 byte payload is invalid per RFC 6455.
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	server.SetCloseHandler(func(code int, text string) error {
+		return &CloseError{Code: code, Text: text}
+	})
+
+	go func() {
+		// Manually write a close frame with 1-byte payload.
+		writeRawFrame(c, true, opClose, []byte{0x42})
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error for 1-byte close payload")
+	}
+	var ce *CloseError
+	if !errors.As(err, &ce) || ce.Code != CloseProtocolError {
+		t.Fatalf("got %v, want CloseProtocolError", err)
 	}
 }

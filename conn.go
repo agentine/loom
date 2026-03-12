@@ -45,8 +45,9 @@ type Conn struct {
 	closeHandler func(code int, text string) error
 
 	// Compression state
-	writeCompress    bool
-	compressionLevel int
+	writeCompress        bool
+	compressionLevel     int
+	compressionNegotiated bool // true when permessage-deflate was negotiated
 
 	// Close state
 	closeSent bool
@@ -125,6 +126,12 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		if err != nil {
 			c.readErr = err
 			return 0, nil, err
+		}
+
+		// Validate RSV bits (RFC 6455 §5.2).
+		if err := c.validateRSV(h); err != nil {
+			c.readErr = &CloseError{Code: CloseProtocolError, Text: err.Error()}
+			return 0, nil, c.readErr
 		}
 
 		// Handle control frames inline.
@@ -304,6 +311,23 @@ func (c *Conn) NetConn() net.Conn {
 
 // ---- Internal methods ----
 
+// errInvalidRSV is returned when RSV bits are set without a negotiated extension.
+var errInvalidRSV = errors.New("websocket: RSV bits set without negotiated extension")
+
+// validateRSV checks that RSV bits are zero unless an extension that defines
+// them has been negotiated (RFC 6455 section 5.2).
+func (c *Conn) validateRSV(h frameHeader) error {
+	// RSV1 is allowed when compression (permessage-deflate) is negotiated.
+	if h.rsv1 && !c.compressionNegotiated {
+		return errInvalidRSV
+	}
+	// RSV2 and RSV3 are not used by any standard extension.
+	if h.rsv2 || h.rsv3 {
+		return errInvalidRSV
+	}
+	return nil
+}
+
 func (c *Conn) setReadDeadline() error {
 	if !c.readDeadline.IsZero() {
 		return c.conn.SetReadDeadline(c.readDeadline)
@@ -380,9 +404,51 @@ func (c *Conn) handleControl(h frameHeader) error {
 			code = int(binary.BigEndian.Uint16(payload[:2]))
 			text = string(payload[2:])
 		}
+		// Validate close code per RFC 6455 §7.4.
+		if len(payload) >= 2 && !isValidCloseCode(code) {
+			c.readErr = &CloseError{Code: CloseProtocolError, Text: "invalid close code"}
+			return c.readErr
+		}
+		// A close frame with payload of 1 byte is invalid (must be 0 or >=2).
+		if len(payload) == 1 {
+			c.readErr = &CloseError{Code: CloseProtocolError, Text: "invalid close payload"}
+			return c.readErr
+		}
 		return c.closeHandler(code, text)
 	}
 	return nil
+}
+
+// isValidCloseCode checks if a close code is valid per RFC 6455 §7.4.
+func isValidCloseCode(code int) bool {
+	// RFC 6455 §7.4.1 defines valid ranges:
+	// 1000-1003: defined
+	// 1004: reserved
+	// 1005: MUST NOT be set in a close frame (no status code was present)
+	// 1006: MUST NOT be set in a close frame (abnormal closure)
+	// 1007-1011: defined
+	// 1012-1014: defined by extensions (IANA registry)
+	// 1015: MUST NOT be set in a close frame (TLS handshake failure)
+	// 3000-3999: registered for libraries/frameworks/applications (IANA)
+	// 4000-4999: reserved for private use
+	switch {
+	case code < 1000:
+		return false
+	case code == 1004:
+		return false
+	case code == CloseNoStatusReceived: // 1005
+		return false
+	case code == CloseAbnormalClosure: // 1006
+		return false
+	case code == CloseTLSHandshake: // 1015
+		return false
+	case code >= 1016 && code <= 2999:
+		return false
+	case code >= 5000:
+		return false
+	default:
+		return true
+	}
 }
 
 func (c *Conn) defaultPingHandler(appData string) error {
@@ -412,6 +478,10 @@ func (c *Conn) advanceContinuation() error {
 		if err != nil {
 			c.readErr = err
 			return err
+		}
+		if err := c.validateRSV(h); err != nil {
+			c.readErr = &CloseError{Code: CloseProtocolError, Text: err.Error()}
+			return c.readErr
 		}
 		if h.isControl() {
 			if err := c.handleControl(h); err != nil {
@@ -464,6 +534,10 @@ func (r *messageReader) Read(p []byte) (int, error) {
 		if err != nil {
 			c.readErr = err
 			return 0, err
+		}
+		if err := c.validateRSV(h); err != nil {
+			c.readErr = &CloseError{Code: CloseProtocolError, Text: err.Error()}
+			return 0, c.readErr
 		}
 		if h.isControl() {
 			if err := c.handleControl(h); err != nil {
