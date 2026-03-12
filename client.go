@@ -2,6 +2,7 @@ package loom
 
 import (
 	"bufio"
+	"compress/flate"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -121,6 +122,9 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	if len(d.Subprotocols) > 0 {
 		reqHeader.Set("Sec-WebSocket-Protocol", strings.Join(d.Subprotocols, ", "))
 	}
+	if d.EnableCompression {
+		reqHeader.Set("Sec-WebSocket-Extensions", "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
+	}
 
 	// Copy caller's headers (don't overwrite handshake headers).
 	for k, vs := range requestHeader {
@@ -199,6 +203,18 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	// Build the Conn.
 	c := newConnFromUpgrade(netConn, bufio.NewReadWriter(br, bufio.NewWriter(netConn)), false)
 	c.subprotocol = resp.Header.Get("Sec-Websocket-Protocol")
+
+	// Check if server accepted permessage-deflate.
+	if d.EnableCompression {
+		for _, ext := range parseExtensions(resp.Header) {
+			if ext == "permessage-deflate" {
+				c.compressionNegotiated = true
+				c.writeCompress = true
+				c.compressionLevel = flate.DefaultCompression
+				break
+			}
+		}
+	}
 
 	return c, resp, nil
 }

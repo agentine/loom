@@ -38,3 +38,23 @@ func headerContains(h http.Header, key, value string) bool {
 	}
 	return false
 }
+
+// parseExtensions extracts extension tokens from the
+// Sec-WebSocket-Extensions header. Returns the extension names
+// (without parameters) in order.
+func parseExtensions(h http.Header) []string {
+	var exts []string
+	for _, line := range h["Sec-Websocket-Extensions"] {
+		for _, ext := range strings.Split(line, ",") {
+			ext = strings.TrimSpace(ext)
+			// Strip parameters (everything after the first ';').
+			if i := strings.IndexByte(ext, ';'); i >= 0 {
+				ext = strings.TrimSpace(ext[:i])
+			}
+			if ext != "" {
+				exts = append(exts, ext)
+			}
+		}
+	}
+	return exts
+}

@@ -2,6 +2,7 @@ package loom
 
 import (
 	"bufio"
+	"compress/flate"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
@@ -95,6 +96,17 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	// Negotiate subprotocol.
 	subprotocol := u.selectSubprotocol(r)
 
+	// Negotiate permessage-deflate compression (RFC 7692).
+	compressNegotiated := false
+	if u.EnableCompression {
+		for _, ext := range parseExtensions(r.Header) {
+			if ext == "permessage-deflate" {
+				compressNegotiated = true
+				break
+			}
+		}
+	}
+
 	// Hijack the connection.
 	hj, ok := w.(http.Hijacker)
 	if !ok {
@@ -119,6 +131,9 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	buf.WriteString("Sec-WebSocket-Accept: " + computeAcceptKey(challengeKey) + "\r\n")
 	if subprotocol != "" {
 		buf.WriteString("Sec-WebSocket-Protocol: " + subprotocol + "\r\n")
+	}
+	if compressNegotiated {
+		buf.WriteString("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n")
 	}
 	// Include extra response headers. Use http.Header.Write() to safely
 	// format headers, which rejects values containing \r or \n and
@@ -145,6 +160,11 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	// Build the Conn.
 	c := newConnFromUpgrade(conn, brw, true)
 	c.subprotocol = subprotocol
+	if compressNegotiated {
+		c.compressionNegotiated = true
+		c.writeCompress = true
+		c.compressionLevel = flate.DefaultCompression
+	}
 	return c, nil
 }
 

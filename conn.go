@@ -45,9 +45,10 @@ type Conn struct {
 	closeHandler func(code int, text string) error
 
 	// Compression state
-	writeCompress        bool
-	compressionLevel     int
+	writeCompress         bool
+	compressionLevel      int
 	compressionNegotiated bool // true when permessage-deflate was negotiated
+	readCompressed        bool // true when current message has RSV1 set (compressed)
 
 	// Close state
 	closeSent bool
@@ -72,6 +73,9 @@ func newConn(conn net.Conn, isServer bool) *Conn {
 
 // ReadMessage reads a complete message from the connection.
 // It returns the message type (TextMessage or BinaryMessage) and the payload.
+// If compression was negotiated and the message is compressed (RSV1 set),
+// the payload is decompressed before being returned. ReadLimit is enforced
+// on the decompressed size.
 func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 	var r io.Reader
 	messageType, r, err = c.NextReader()
@@ -79,6 +83,17 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 		return 0, nil, err
 	}
 	p, err = io.ReadAll(r)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// Decompress if this message had RSV1 set (permessage-deflate).
+	if c.readCompressed {
+		p, err = decompressData(p, c.readLimit)
+		if err != nil {
+			return 0, nil, err
+		}
+	}
 	return messageType, p, err
 }
 
@@ -156,8 +171,12 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		c.readMasked = h.masked
 		c.readMaskKey = h.mask
 		c.readMaskPos = 0
+		c.readCompressed = h.rsv1 && c.compressionNegotiated
 
-		if c.readLimit > 0 && c.readTotal > c.readLimit {
+		// When compression is active, skip the wire-size readLimit check
+		// here because the compressed size is not meaningful — the limit
+		// will be enforced after decompression in ReadMessage.
+		if !c.readCompressed && c.readLimit > 0 && c.readTotal > c.readLimit {
 			c.readErr = ErrReadLimit
 			return 0, nil, c.readErr
 		}
@@ -340,6 +359,21 @@ func (c *Conn) writeFrame(fin bool, opcode int, data []byte) error {
 		fin:    fin,
 		opcode: opcode,
 		length: int64(len(data)),
+	}
+
+	// Apply permessage-deflate compression for data frames when negotiated
+	// and enabled. RSV1 is set only on the first frame of a message (not
+	// continuation frames). Control frames are never compressed.
+	compress := c.compressionNegotiated && c.writeCompress &&
+		(opcode == opText || opcode == opBinary) && len(data) > 0
+	if compress {
+		compressed, err := compressData(data, c.compressionLevel)
+		if err != nil {
+			return err
+		}
+		data = compressed
+		h.rsv1 = true
+		h.length = int64(len(data))
 	}
 
 	// Clients must mask frames.

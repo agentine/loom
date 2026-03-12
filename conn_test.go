@@ -485,6 +485,7 @@ func TestRSV1_RejectedWithoutCompression(t *testing.T) {
 
 func TestRSV1_AllowedWithCompression(t *testing.T) {
 	// RSV1=1 should be accepted when compression is negotiated.
+	// Send actual compressed data so decompression succeeds.
 	s, c := net.Pipe()
 	defer s.Close()
 	defer c.Close()
@@ -492,8 +493,14 @@ func TestRSV1_AllowedWithCompression(t *testing.T) {
 	server := newConn(s, true)
 	server.compressionNegotiated = true
 
+	// Compress "hello" per permessage-deflate (strip trailing sync marker).
+	compressed, err := compressData([]byte("hello"), 0)
+	if err != nil {
+		t.Fatalf("compressData: %v", err)
+	}
+
 	go func() {
-		writeRawFrameRSV(c, true, true, false, false, opText, []byte("hello"))
+		writeRawFrameRSV(c, true, true, false, false, opText, compressed)
 	}()
 
 	msgType, p, err := server.ReadMessage()
