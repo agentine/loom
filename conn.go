@@ -28,6 +28,7 @@ type Conn struct {
 	readDeadline  time.Time
 	readErr       error
 	readRemaining int64 // bytes remaining in current frame
+	readTotal     int64 // total bytes consumed in current message (for readLimit enforcement)
 	readFinal     bool  // true if current frame is final
 	readOpcode    int   // opcode of current message (text or binary)
 	readMasked    bool
@@ -144,11 +145,12 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		c.readOpcode = h.opcode
 		c.readFinal = h.fin
 		c.readRemaining = h.length
+		c.readTotal = h.length
 		c.readMasked = h.masked
 		c.readMaskKey = h.mask
 		c.readMaskPos = 0
 
-		if c.readLimit > 0 && h.length > c.readLimit {
+		if c.readLimit > 0 && c.readTotal > c.readLimit {
 			c.readErr = ErrReadLimit
 			return 0, nil, c.readErr
 		}
@@ -423,9 +425,24 @@ func (c *Conn) advanceContinuation() error {
 		}
 		c.readFinal = h.fin
 		c.readRemaining = h.length
+		c.readTotal += h.length
 		c.readMasked = h.masked
 		c.readMaskKey = h.mask
 		c.readMaskPos = 0
+
+		if c.readLimit > 0 && c.readTotal > c.readLimit {
+			c.readErr = ErrReadLimit
+			return c.readErr
+		}
+
+		// Drain the payload of this continuation frame.
+		if c.readRemaining > 0 {
+			if _, err := io.CopyN(io.Discard, c.br, c.readRemaining); err != nil {
+				c.readErr = err
+				return err
+			}
+			c.readRemaining = 0
+		}
 	}
 	return nil
 }
@@ -460,11 +477,12 @@ func (r *messageReader) Read(p []byte) (int, error) {
 		}
 		c.readFinal = h.fin
 		c.readRemaining = h.length
+		c.readTotal += h.length
 		c.readMasked = h.masked
 		c.readMaskKey = h.mask
 		c.readMaskPos = 0
 
-		if c.readLimit > 0 && h.length > c.readLimit {
+		if c.readLimit > 0 && c.readTotal > c.readLimit {
 			c.readErr = ErrReadLimit
 			return 0, c.readErr
 		}

@@ -332,3 +332,99 @@ func TestLocalRemoteAddr(t *testing.T) {
 		t.Fatal("RemoteAddr should not be nil")
 	}
 }
+
+// writeRawFrame writes a raw WebSocket frame (unmasked, from a server) to w.
+func writeRawFrame(w io.Writer, fin bool, opcode int, payload []byte) error {
+	h := frameHeader{
+		fin:    fin,
+		opcode: opcode,
+		length: int64(len(payload)),
+	}
+	if err := writeFrameHeader(w, h); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		_, err := w.Write(payload)
+		return err
+	}
+	return nil
+}
+
+// --- Bug #97: ReadLimit must be enforced per-message, not per-frame ---
+
+func TestReadLimit_FragmentedMessage(t *testing.T) {
+	// A message fragmented into frames each smaller than readLimit,
+	// but whose total exceeds readLimit, must return ErrReadLimit.
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	server.SetReadLimit(10) // limit is 10 bytes total
+
+	// Suppress close handler writing back (pipe might be closed).
+	server.SetCloseHandler(func(code int, text string) error {
+		server.readErr = &CloseError{Code: code, Text: text}
+		return server.readErr
+	})
+
+	// Writer goroutine: send a message as 3 fragments of 5 bytes each (total 15 > 10).
+	go func() {
+		chunk := []byte("AAAAA") // 5 bytes each
+		// First frame: opcode=text, fin=false
+		writeRawFrame(c, false, opText, chunk)
+		// Second frame: continuation, fin=false
+		writeRawFrame(c, false, opContinuation, chunk)
+		// Third frame: continuation, fin=true
+		writeRawFrame(c, true, opContinuation, chunk)
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err != ErrReadLimit {
+		t.Fatalf("got %v, want ErrReadLimit", err)
+	}
+}
+
+func TestReadLimit_FragmentedMessage_ExactLimit(t *testing.T) {
+	// A fragmented message whose total equals readLimit should succeed.
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	server.SetReadLimit(10) // limit is 10 bytes total
+
+	// Writer goroutine: send 2 fragments of 5 bytes each (total 10 == limit).
+	go func() {
+		chunk := []byte("AAAAA") // 5 bytes each
+		writeRawFrame(c, false, opText, chunk)
+		writeRawFrame(c, true, opContinuation, chunk)
+	}()
+
+	_, p, err := server.ReadMessage()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(p) != 10 {
+		t.Fatalf("expected 10 bytes, got %d", len(p))
+	}
+}
+
+func TestReadLimit_SingleFrameExceedsLimit(t *testing.T) {
+	// A single frame exceeding readLimit should still fail (regression check).
+	s, c := net.Pipe()
+	defer s.Close()
+	defer c.Close()
+
+	server := newConn(s, true)
+	server.SetReadLimit(5)
+
+	go func() {
+		writeRawFrame(c, true, opText, []byte("too long!!"))
+	}()
+
+	_, _, err := server.ReadMessage()
+	if err != ErrReadLimit {
+		t.Fatalf("got %v, want ErrReadLimit", err)
+	}
+}
