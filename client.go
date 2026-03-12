@@ -203,7 +203,8 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	return c, resp, nil
 }
 
-// dial establishes the TCP (or TLS) connection.
+// dial establishes the TCP (or TLS) connection, optionally through an
+// HTTP proxy when d.Proxy is configured.
 func (d *Dialer) dial(ctx context.Context, u *url.URL, hostPort string) (net.Conn, error) {
 	useTLS := u.Scheme == "https"
 
@@ -214,10 +215,17 @@ func (d *Dialer) dial(ctx context.Context, u *url.URL, hostPort string) (net.Con
 	var netConn net.Conn
 	var err error
 
+	// When a custom dial function is provided, it takes precedence over
+	// proxy configuration (the caller controls the transport).
 	if d.NetDialContext != nil {
 		netConn, err = d.NetDialContext(ctx, "tcp", hostPort)
 	} else if d.NetDial != nil {
 		netConn, err = d.NetDial("tcp", hostPort)
+	} else if proxyURL, pErr := d.proxyURL(u); pErr != nil {
+		return nil, pErr
+	} else if proxyURL != nil {
+		// Dial through the HTTP proxy.
+		netConn, err = proxyDialer(ctx, proxyURL, hostPort)
 	} else {
 		netDialer := &net.Dialer{}
 		netConn, err = netDialer.DialContext(ctx, "tcp", hostPort)
@@ -242,6 +250,17 @@ func (d *Dialer) dial(ctx context.Context, u *url.URL, hostPort string) (net.Con
 	}
 
 	return netConn, nil
+}
+
+// proxyURL returns the proxy URL for the given target URL, or nil if no
+// proxy is configured.
+func (d *Dialer) proxyURL(u *url.URL) (*url.URL, error) {
+	if d.Proxy == nil {
+		return nil, nil
+	}
+	// Build a minimal request to pass to the Proxy function.
+	req := &http.Request{URL: u, Host: u.Host}
+	return d.Proxy(req)
 }
 
 func hostPort(u *url.URL) string {
