@@ -265,12 +265,12 @@ func (d *Dialer) proxyURL(u *url.URL) (*url.URL, error) {
 
 func hostPort(u *url.URL) string {
 	host := u.Host
-	if !strings.Contains(host, ":") {
+	if u.Port() == "" {
 		switch u.Scheme {
-		case "https", "wss":
-			host += ":443"
+		case "https":
+			host = net.JoinHostPort(u.Hostname(), "443")
 		default:
-			host += ":80"
+			host = net.JoinHostPort(u.Hostname(), "80")
 		}
 	}
 	return host

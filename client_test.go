@@ -447,6 +447,57 @@ func TestDial_ProxyError(t *testing.T) {
 	}
 }
 
+func TestHostPort_IPv6(t *testing.T) {
+	tests := []struct {
+		name string
+		rawURL string
+		want string
+	}{
+		{
+			name:   "IPv6 without port gets default http port",
+			rawURL: "http://[::1]/path",
+			want:   "[::1]:80",
+		},
+		{
+			name:   "IPv6 without port gets default https port",
+			rawURL: "https://[::1]/path",
+			want:   "[::1]:443",
+		},
+		{
+			name:   "IPv6 with explicit port preserved",
+			rawURL: "http://[::1]:9090/path",
+			want:   "[::1]:9090",
+		},
+		{
+			name:   "IPv4 without port gets default http port",
+			rawURL: "http://127.0.0.1/path",
+			want:   "127.0.0.1:80",
+		},
+		{
+			name:   "IPv4 with explicit port preserved",
+			rawURL: "http://127.0.0.1:8080/path",
+			want:   "127.0.0.1:8080",
+		},
+		{
+			name:   "hostname without port gets default https port",
+			rawURL: "https://example.com/path",
+			want:   "example.com:443",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := url.Parse(tc.rawURL)
+			if err != nil {
+				t.Fatalf("url.Parse(%q): %v", tc.rawURL, err)
+			}
+			got := hostPort(u)
+			if got != tc.want {
+				t.Errorf("hostPort(%q) = %q, want %q", tc.rawURL, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDial_ProxyCustomDialOverridesProxy(t *testing.T) {
 	// When NetDialContext is set, the Proxy function should NOT be called.
 	srv := newTestServer(t, nil, false)
