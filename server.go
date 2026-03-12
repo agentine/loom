@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -119,11 +120,16 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	if subprotocol != "" {
 		buf.WriteString("Sec-WebSocket-Protocol: " + subprotocol + "\r\n")
 	}
-	// Include extra response headers.
-	for k, vs := range responseHeader {
-		for _, v := range vs {
-			buf.WriteString(k + ": " + v + "\r\n")
-		}
+	// Include extra response headers. Use http.Header.Write() to safely
+	// format headers, which rejects values containing \r or \n and
+	// prevents HTTP response splitting / header injection.
+	if err := validateHeader(responseHeader); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := http.Header(responseHeader).Write(&buf); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	buf.WriteString("\r\n")
 
@@ -187,6 +193,22 @@ func checkSameOrigin(r *http.Request) bool {
 		originHost = h
 	}
 	return strings.EqualFold(originHost, host)
+}
+
+// validateHeader checks that no header key or value contains \r or \n,
+// which would allow HTTP response splitting.
+func validateHeader(h http.Header) error {
+	for k, vs := range h {
+		if strings.ContainsAny(k, "\r\n") {
+			return fmt.Errorf("websocket: invalid header key %q contains CR/LF", k)
+		}
+		for _, v := range vs {
+			if strings.ContainsAny(v, "\r\n") {
+				return fmt.Errorf("websocket: invalid header value for %q contains CR/LF", k)
+			}
+		}
+	}
+	return nil
 }
 
 // newConnFromUpgrade creates a Conn from a hijacked connection, reusing

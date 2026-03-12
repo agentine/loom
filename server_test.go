@@ -353,6 +353,108 @@ func TestUpgrade_EchoRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUpgrade_HeaderInjectionBlocked(t *testing.T) {
+	upgrader := Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"value with CRLF", "X-Safe-Key", "bad\r\nInjected: header"},
+		{"value with bare LF", "X-Safe-Key", "bad\nInjected: header"},
+		{"value with bare CR", "X-Safe-Key", "bad\rInjected: header"},
+		{"key with CRLF", "X-Bad\r\nKey", "safe-value"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errCh := make(chan error, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				h := http.Header{}
+				h.Set(tt.key, tt.value)
+				_, err := upgrader.Upgrade(w, r, h)
+				errCh <- err
+			}))
+			defer srv.Close()
+
+			// After hijack, if header validation fails, the connection is
+			// closed without writing a response. The client sees EOF.
+			addr := srv.URL[7:] // strip http://
+			conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+
+			key := "dGhlIHNhbXBsZSBub25jZQ=="
+			req := "GET / HTTP/1.1\r\nHost: " + addr + "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n\r\n"
+			conn.Write([]byte(req))
+
+			// Read whatever the server sends back; we expect an error or EOF.
+			buf := make([]byte, 4096)
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, _ := conn.Read(buf)
+
+			// The injected header must NOT appear in the response.
+			response := string(buf[:n])
+			if strings.Contains(response, "Injected") {
+				t.Fatalf("header injection succeeded; response contains injected header:\n%s", response)
+			}
+
+			// Server-side: Upgrade must have returned an error.
+			upgradeErr := <-errCh
+			if upgradeErr == nil {
+				t.Error("expected Upgrade to return an error for header with CR/LF, got nil")
+			}
+		})
+	}
+}
+
+func TestValidateHeader(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  http.Header
+		wantErr bool
+	}{
+		{
+			name:    "clean headers",
+			header:  http.Header{"X-Foo": {"bar"}, "X-Baz": {"qux"}},
+			wantErr: false,
+		},
+		{
+			name:    "nil header",
+			header:  nil,
+			wantErr: false,
+		},
+		{
+			name:    "value with newline",
+			header:  http.Header{"X-Foo": {"bar\nbaz"}},
+			wantErr: true,
+		},
+		{
+			name:    "value with carriage return",
+			header:  http.Header{"X-Foo": {"bar\rbaz"}},
+			wantErr: true,
+		},
+		{
+			name:    "value with CRLF",
+			header:  http.Header{"X-Foo": {"bar\r\nbaz"}},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateHeader(tt.header)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateHeader() error = %v, wantErr = %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestUpgrade_HandshakeTimeout(t *testing.T) {
 	upgrader := Upgrader{
 		HandshakeTimeout: 50 * time.Millisecond,
