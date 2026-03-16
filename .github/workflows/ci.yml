@@ -13,7 +13,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go-version: ["1.21", "1.22", "1.23"]
+        go-version: ["1.25", "1.26"]
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
 
       - name: Fuzz ReadFrameHeader
         run: go test -fuzz=FuzzReadFrameHeader -fuzztime=30s ./...
@@ -54,7 +54,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.26"
 
       - name: Benchmark
         run: go test -bench=. -benchmem -count=1 -run=^$ ./...
